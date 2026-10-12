@@ -1,11 +1,12 @@
-# Storage Auditor & Safe Mover — Fase 2 (v0.2.0)
+# Storage Auditor & Safe Mover — Fase 3 (v0.3.0)
 
-Motor de auditoria, desduplicação, inventário de jogos e mapeamento de dependências de armazenamento entre SSD C: e D:, equipado com **Interface Desktop CustomTkinter**, **Exportador Excel (.xlsx)** e operação **100% somente leitura (Read-Only)**.
+Motor de auditoria, desduplicação, inventário de jogos e movimentação segura de arquivos entre SSD C: e D:, equipado com **Interface Desktop CustomTkinter**, **Exportador Excel (.xlsx)** e **Safe Mover (Cópia Segura Não-Destrutiva)**.
 
 ---
 
 ## 🛡️ Aviso de Segurança e Integridade
-O Motor 1 (Auditor & Reporter) opera **exclusivamente em modo somente leitura**. Nenhum arquivo pessoal do usuário é alterado, movido, renomeado ou excluído. Planos de ação ou movimentações automatizadas (Safe Mover) pertencem a fases posteriores e não estão conectados.
+- **Motor 1 (Auditor & Reporter):** opera **exclusivamente em modo somente leitura**. Nenhum arquivo pessoal do usuário é alterado, movido, renomeado ou excluído.
+- **Motor 2 (Safe Mover - Fase 3):** opera em **modo estritamente não-destrutivo**. Realiza cópia controlada por plano de ação aprovado, com validação de hash SHA-256 no destino e **preservação 100% intacta da origem**. Não realiza exclusão, desduplicação física ou limpeza de pastas.
 
 ---
 
@@ -88,7 +89,7 @@ Com parâmetros customizados:
 
 ### 5. Execução dos Testes Automatizados
 
-Para executar os 35 testes unitários e de regressão (100% passando):
+Para executar os 53 testes unitários, de regressão, streaming Excel e Safe Mover (100% passando):
 ```powershell
 .venv\Scripts\pytest -v
 ```

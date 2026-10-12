@@ -38,6 +38,7 @@ from gui.views.tab_documents import DocumentsView
 from gui.views.tab_duplicates import DuplicatesView
 from gui.views.tab_games import GamesView
 from gui.views.tab_pending import PendingView
+from gui.views.tab_safe_mover import SafeMoverView
 from gui.views.tab_summary import SummaryView
 from gui.worker import AuditWorker
 
@@ -252,6 +253,7 @@ class StorageAuditorApp(ctk.CTk):
         tab_pendentes = self.tabview.add("Pendentes de Backup")
         tab_documentos = self.tabview.add("Documentos Avulsos")
         tab_jogos = self.tabview.add("Jogos e Saves")
+        tab_safemover = self.tabview.add("Plano de Cópia Segura")
 
         # Instancia componentes de cada aba
         self.view_summary = SummaryView(
@@ -273,6 +275,13 @@ class StorageAuditorApp(ctk.CTk):
 
         self.view_games = GamesView(tab_jogos, data_loader=self.data_loader)
         self.view_games.pack(fill="both", expand=True)
+
+        self.view_safemover = SafeMoverView(
+            tab_safemover,
+            data_loader=self.data_loader,
+            reports_dir=self.var_output_dir.get().strip() or "reports",
+        )
+        self.view_safemover.pack(fill="both", expand=True)
 
         # -------------------------------------------------------------
         # 4. Rodapé
@@ -574,17 +583,19 @@ class StorageAuditorApp(ctk.CTk):
         )
 
     def _on_close_window(self) -> None:
-        """Trata o encerramento seguro da janela."""
-        if (self.worker and self.worker.is_running) or self.is_exporting:
+        is_safemover_running = hasattr(self, "view_safemover") and self.view_safemover.is_running
+        if (self.worker and self.worker.is_running) or self.is_exporting or is_safemover_running:
             if messagebox.askyesno(
                 "Processo em Andamento",
-                "Uma auditoria ou exportação está em execução. Deseja cancelar e sair?",
+                "Uma auditoria, exportação ou cópia segura está em execução. Deseja cancelar e sair?",
                 parent=self,
             ):
                 if self.worker and self.worker.is_running:
                     self.worker.cancel()
                 if self.is_exporting and self.export_cancel_event:
                     self.export_cancel_event.set()
+                if is_safemover_running and self.view_safemover.cancel_event:
+                    self.view_safemover.cancel_event.set()
                 self.destroy()
         else:
             self.destroy()

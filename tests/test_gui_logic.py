@@ -67,6 +67,7 @@ def test_gui_app_initialization():
     assert hasattr(app, "view_pending")
     assert hasattr(app, "view_documents")
     assert hasattr(app, "view_games")
+    assert hasattr(app, "view_safemover")
 
     # Destrói a janela para liberar recursos
     app.destroy()
