@@ -12,6 +12,7 @@ Implementa a janela principal responsiva com:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import queue
@@ -31,7 +32,7 @@ from config import (
     get_save_candidate_roots,
     parse_cli_path_list,
 )
-from exporters.excel_exporter import ExcelReportExporter
+from exporters.excel_exporter import ExcelReportExporter, ExportCancelledError
 from gui.data_loader import AuditDataLoader
 from gui.views.tab_documents import DocumentsView
 from gui.views.tab_duplicates import DuplicatesView
@@ -58,6 +59,11 @@ class StorageAuditorApp(ctk.CTk):
         # Fila thread-safe de eventos de auditoria
         self.event_queue: queue.Queue = queue.Queue()
         self.worker: Optional[AuditWorker] = None
+
+        # Controle de exportação em background
+        self.is_exporting: bool = False
+        self.export_cancel_event: Optional[threading.Event] = None
+        self.export_thread: Optional[threading.Thread] = None
 
         # Carregador de dados em memória
         self.data_loader = AuditDataLoader(reports_dir="reports")
@@ -467,28 +473,118 @@ class StorageAuditorApp(ctk.CTk):
         self.view_games.refresh_view()
 
     def _export_excel(self) -> None:
-        """Gera a planilha Excel (.xlsx) completa."""
+        """Dispara a exportação para planilha Excel (.xlsx) em thread separada com streaming de baixo consumo."""
+        if self.is_exporting:
+            messagebox.showinfo("Exportação em Andamento", "Uma exportação já está sendo executada. Aguarde a finalização.")
+            return
+
         if not self.data_loader.is_loaded:
             messagebox.showwarning("Dados Ausentes", "Nenhum relatório encontrado para exportar. Execute a auditoria primeiro.")
             return
 
         r_dir = self.var_output_dir.get().strip() or "reports"
-        exporter = ExcelReportExporter(output_dir=r_dir)
+        default_name = f"relatorio_auditoria_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        initial_dir = os.path.abspath(r_dir)
 
-        try:
-            excel_path = exporter.export_from_reports_dir(reports_dir=r_dir)
-            messagebox.showinfo(
-                "Exportação Concluída",
-                f"Planilha Excel profissional gerada com sucesso!\n\nArquivo:\n{os.path.abspath(excel_path)}",
+        # Diálogo nativo para escolha do arquivo de destino
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Salvar Relatório Excel Completo",
+            initialdir=initial_dir,
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Planilha Excel (*.xlsx)", "*.xlsx"), ("Todos os Arquivos (*.*)", "*.*")],
+        )
+        if not file_path:
+            return  # Usuário cancelou diálogo
+
+        # Confirmação explícita se o arquivo de destino já existe
+        if os.path.exists(file_path):
+            confirmed = messagebox.askyesno(
+                "Confirmar Substituição",
+                f"O arquivo '{os.path.basename(file_path)}' já existe.\n\nDeseja substituí-lo?",
+                icon="warning",
+                parent=self,
             )
-        except Exception as e:
-            messagebox.showerror("Erro na Exportação", f"Falha ao gerar planilha Excel:\n{e}")
+            if not confirmed:
+                return
+
+        # Configura estado da interface
+        self.is_exporting = True
+        self.export_cancel_event = threading.Event()
+        self.status_pill.configure(text="📊 EXPORTANDO EXCEL...", text_color="#2563EB")
+        self.progress_bar.set(0.05)
+        self.lbl_progress_status.configure(text="Iniciando exportação em streaming de baixo consumo de memória...")
+
+        # Thread dedicada para não travar a interface gráfica
+        def _run_worker() -> None:
+            exporter = ExcelReportExporter(output_dir=r_dir)
+            try:
+                def _prog_cb(msg: str, frac: float) -> None:
+                    self.after(0, lambda m=msg, f=frac: self._update_export_progress(m, f))
+
+                excel_path = exporter.export_from_reports_dir(
+                    reports_dir=r_dir,
+                    target_filepath=file_path,
+                    cancel_event=self.export_cancel_event,
+                    progress_callback=_prog_cb,
+                )
+                self.after(0, lambda p=excel_path: self._on_export_finished(p))
+            except ExportCancelledError:
+                self.after(0, self._on_export_cancelled)
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_export_error(err))
+
+        self.export_thread = threading.Thread(target=_run_worker, daemon=True, name="ExcelExportThread")
+        self.export_thread.start()
+
+    def _update_export_progress(self, message: str, fraction: float) -> None:
+        """Atualiza barra de progresso da exportação na thread da GUI."""
+        self.lbl_progress_status.configure(text=message)
+        self.progress_bar.set(fraction)
+
+    def _on_export_finished(self, excel_path: str) -> None:
+        """Callback executado na thread da GUI após conclusão da exportação."""
+        self.is_exporting = False
+        self.status_pill.configure(text="🟢 PRONTO", text_color="#059669")
+        self.progress_bar.set(1.0)
+        self.lbl_progress_status.configure(text="Planilha Excel exportada com sucesso!")
+        messagebox.showinfo(
+            "Exportação Concluída",
+            f"Planilha Excel gerada com sucesso via streaming de baixo consumo!\n\nArquivo:\n{os.path.abspath(excel_path)}",
+            parent=self,
+        )
+
+    def _on_export_cancelled(self) -> None:
+        """Callback executado na thread da GUI após cancelamento da exportação."""
+        self.is_exporting = False
+        self.status_pill.configure(text="⏹ CANCELADO", text_color="gray70")
+        self.lbl_progress_status.configure(text="Exportação Excel cancelada. O arquivo anterior foi preservado.")
+        messagebox.showwarning("Exportação Cancelada", "A exportação para Excel foi cancelada.", parent=self)
+
+    def _on_export_error(self, err_message: str) -> None:
+        """Callback executado na thread da GUI após erro na exportação."""
+        self.is_exporting = False
+        self.status_pill.configure(text="❌ ERRO", text_color="#DC2626")
+        self.lbl_progress_status.configure(text=f"Erro na exportação Excel: {err_message}")
+        messagebox.showerror(
+            "Erro na Exportação",
+            f"Ocorreu um erro durante a geração da planilha Excel:\n\n{err_message}\n\nNenhum arquivo anterior foi corrompido.",
+            parent=self,
+        )
 
     def _on_close_window(self) -> None:
         """Trata o encerramento seguro da janela."""
-        if self.worker and self.worker.is_running:
-            if messagebox.askyesno("Auditoria em Andamento", "Uma auditoria está em execução. Deseja cancelar e sair?"):
-                self.worker.cancel()
+        if (self.worker and self.worker.is_running) or self.is_exporting:
+            if messagebox.askyesno(
+                "Processo em Andamento",
+                "Uma auditoria ou exportação está em execução. Deseja cancelar e sair?",
+                parent=self,
+            ):
+                if self.worker and self.worker.is_running:
+                    self.worker.cancel()
+                if self.is_exporting and self.export_cancel_event:
+                    self.export_cancel_event.set()
                 self.destroy()
         else:
             self.destroy()

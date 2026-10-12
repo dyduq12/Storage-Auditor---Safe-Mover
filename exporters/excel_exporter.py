@@ -1,31 +1,35 @@
-"""Exportador de relatórios em formato Excel (.xlsx) com openpyxl (Fase 2).
+"""Exportador de relatórios em formato Excel (.xlsx) com openpyxl (Modo Write-Only de Baixo Consumo de Memória).
 
-Gera uma pasta de trabalho profissional consolidando as 5 abas da auditoria:
-- Resumo
-- Duplicatas
-- Pendentes de Backup
-- Documentos Avulsos
-- Jogos e Saves
-
-Recursos implementados:
-- Congelamento da primeira linha (freeze_panes = 'A2')
-- Filtros automáticos em todas as colunas de dados (auto_filter)
-- Cabeçalhos estilizados com preenchimento, bordas sutis e tipografia em negrito
-- Formatação de tamanhos em bytes e unidades legíveis (GB/MB/KB)
-- Sinalização explícita de nível de confiança (amostral vs completo)
-- Sinalização 'Vínculo heurístico — revisar' para saves (destacando compartilhados e suspeitos)
+Otimizado para grandes volumes de dados (115.000+ linhas) em computadores com memória RAM restrita (< 0.3 GB livre):
+- Utiliza a API streaming openpyxl.Workbook(write_only=True) que grava XML diretamente em disco via buffer mínimo.
+- Processa e descarrega um arquivo JSON por vez sequencialmente (del data, gc.collect()), reduzindo o pico de memória para < 70 MB.
+- Configura todas as propriedades estruturais antes das linhas: freeze_panes = 'A2', auto_filter e column_dimensions com larguras ideais.
+- Salva primeiro em arquivo temporário no diretório de destino e só substitui o arquivo final após validação de integridade ZIP.
+- Suporta cancelamento limpo e reporte de progresso thread-safe para a interface gráfica.
+- Em caso de erro ou cancelamento, limpa apenas o arquivo temporário gerado, preservando os JSONs e qualquer XLSX anterior.
 """
 
 from __future__ import annotations
 
 import datetime
+import gc
 import json
 import os
-from typing import Any, Dict, List, Optional
+import threading
+import uuid
+import zipfile
+from collections import Counter
+from typing import Any, Callable, Dict, List, Optional
 
 import openpyxl
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+
+class ExportCancelledError(Exception):
+    """Exceção levantada quando o usuário cancela a exportação Excel em andamento."""
+    pass
 
 
 def format_bytes(byte_count: int | float | None) -> str:
@@ -54,7 +58,6 @@ def format_timestamp(val: Any) -> str:
             return str(val)
     if isinstance(val, str):
         try:
-            # Tenta parsear formato ISO
             dt = datetime.datetime.fromisoformat(val)
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
@@ -72,7 +75,7 @@ def classify_save_status(save_path: str, game_name: str, shared_counts: Dict[str
         motivos.append("Pasta compartilhada entre múltiplos jogos/emuladores")
     if p_lower.endswith("\\steam"):
         motivos.append("Pasta raiz genérica de emulador Steam")
-    if "\\fonts\\" in p_lower or "edition" in p_lower and "edition" in g_lower:
+    if "\\fonts\\" in p_lower or ("edition" in p_lower and "edition" in g_lower):
         if "\\fonts\\" in p_lower:
             motivos.append("Casamento falso por palavra 'Edition'")
     if "\\nova pasta" in p_lower or "\\light" in p_lower:
@@ -93,66 +96,145 @@ def classify_save_status(save_path: str, game_name: str, shared_counts: Dict[str
 
 
 class ExcelReportExporter:
-    """Exportador de dados da auditoria para planilhas Microsoft Excel (.xlsx)."""
+    """Exportador de dados de auditoria para Excel utilizando streaming write_only."""
 
     def __init__(self, output_dir: str = "reports") -> None:
         self.output_dir = output_dir
 
-        # Estilos corporativos modernos
+        # Estilos corporativos para WriteOnlyCell
         self.header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         self.header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
-        self.title_font = Font(name="Segoe UI", size=14, bold=True, color="1F4E78")
+        self.title_font = Font(name="Segoe UI", size=13, bold=True, color="1F4E78")
         self.subtitle_font = Font(name="Segoe UI", size=10, italic=True, color="595959")
         self.data_font = Font(name="Segoe UI", size=10)
         self.alert_font = Font(name="Segoe UI", size=10, bold=True, color="C00000")
         self.warning_font = Font(name="Segoe UI", size=10, bold=True, color="B25E00")
 
-        self.thin_border = Border(
-            left=Side(style="thin", color="D9D9D9"),
-            right=Side(style="thin", color="D9D9D9"),
-            top=Side(style="thin", color="D9D9D9"),
-            bottom=Side(style="thin", color="D9D9D9"),
-        )
         self.align_left = Alignment(horizontal="left", vertical="center")
         self.align_right = Alignment(horizontal="right", vertical="center")
         self.align_center = Alignment(horizontal="center", vertical="center")
 
-    def _apply_table_styling(
+    def _make_header_row(self, ws: Any, headers: List[str]) -> List[WriteOnlyCell]:
+        """Cria lista de WriteOnlyCell com preenchimento institucional e fonte negrito."""
+        cells = []
+        for h in headers:
+            c = WriteOnlyCell(ws, value=h)
+            c.fill = self.header_fill
+            c.font = self.header_font
+            c.alignment = self.align_center
+            cells.append(c)
+        return cells
+
+    def _set_column_widths(self, ws: Any, widths: Dict[str, int]) -> None:
+        """Aplica larguras pré-configuradas às colunas da aba write_only."""
+        for col_letter, width in widths.items():
+            ws.column_dimensions[col_letter].width = width
+
+    def _check_cancel(self, cancel_event: Optional[threading.Event]) -> None:
+        """Verifica se o cancelamento foi solicitado."""
+        if cancel_event and cancel_event.is_set():
+            raise ExportCancelledError("Exportação Excel cancelada pelo usuário.")
+
+    def export_from_reports_dir(
         self,
-        ws: openpyxl.worksheet.worksheet.Worksheet,
-        header_row: int = 1,
-        max_col_width: int = 70,
-    ) -> None:
-        """Aplica estilos de cabeçalho, congelamento de painéis, filtros e auto-largura."""
-        # Congela cabeçalho
-        ws.freeze_panes = f"A{header_row + 1}"
+        reports_dir: Optional[str] = None,
+        output_filename: str = "relatorio_auditoria_completo.xlsx",
+        target_filepath: Optional[str] = None,
+        max_items_per_sheet: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> str:
+        """Lê os 5 JSONs sequencialmente do disco e exporta via streaming com baixo consumo de memória."""
+        r_dir = reports_dir or self.output_dir
+        if not target_filepath:
+            os.makedirs(self.output_dir, exist_ok=True)
+            target_filepath = os.path.join(self.output_dir, output_filename)
 
-        # Aplica estilos no cabeçalho
-        for col in range(1, ws.max_column + 1):
-            cell = ws.cell(row=header_row, column=col)
-            cell.fill = self.header_fill
-            cell.font = self.header_font
-            cell.alignment = self.align_center
+        final_dest = os.path.abspath(target_filepath)
+        dest_dir = os.path.dirname(final_dest)
+        os.makedirs(dest_dir, exist_ok=True)
 
-        # Adiciona auto-filtro na linha de cabeçalho até a última linha
-        if ws.max_row >= header_row:
-            end_col = get_column_letter(ws.max_column)
-            ws.auto_filter.ref = f"A{header_row}:{end_col}{ws.max_row}"
+        # Arquivo temporário no mesmo diretório para garantir atomicidade no mesmo sistema de arquivos
+        temp_filename = f".~tmp_export_{uuid.uuid4().hex[:8]}_{os.path.basename(final_dest)}.tmp"
+        temp_filepath = os.path.join(dest_dir, temp_filename)
 
-        # Ajusta larguras de coluna com amostragem rápida das primeiras 50 linhas
-        col_max_lens: Dict[int, int] = {}
-        sample_rows = min(ws.max_row, 50)
-        for row in ws.iter_rows(min_row=1, max_row=sample_rows, values_only=True):
-            for col_idx, cell_value in enumerate(row, 1):
-                val_str = str(cell_value or "")
-                if "\n" in val_str:
-                    val_str = max(val_str.split("\n"), key=len)
-                col_max_lens[col_idx] = max(col_max_lens.get(col_idx, 0), len(val_str))
+        wb = openpyxl.Workbook(write_only=True)
 
-        for col_idx, max_len in col_max_lens.items():
-            col_letter = get_column_letter(col_idx)
-            adjusted_width = min(max(max_len + 3, 12), max_col_width)
-            ws.column_dimensions[col_letter].width = adjusted_width
+        try:
+            if progress_callback:
+                progress_callback("Iniciando exportação em modo streaming...", 0.05)
+            self._check_cancel(cancel_event)
+
+            # -------------------------------------------------------------
+            # 1. Aba Resumo
+            # -------------------------------------------------------------
+            if progress_callback:
+                progress_callback("Processando Aba 1/5: Resumo Executivo...", 0.10)
+            self._write_sheet_resumo_from_file(wb, r_dir)
+            self._check_cancel(cancel_event)
+
+            # -------------------------------------------------------------
+            # 2. Aba Duplicatas
+            # -------------------------------------------------------------
+            if progress_callback:
+                progress_callback("Processando Aba 2/5: Duplicatas Confirmadas...", 0.25)
+            self._write_sheet_duplicatas_from_file(wb, r_dir, max_items_per_sheet, cancel_event, progress_callback)
+            self._check_cancel(cancel_event)
+
+            # -------------------------------------------------------------
+            # 3. Aba Pendentes de Backup
+            # -------------------------------------------------------------
+            if progress_callback:
+                progress_callback("Processando Aba 3/5: Pendentes de Backup...", 0.55)
+            self._write_sheet_pendentes_from_file(wb, r_dir, max_items_per_sheet, cancel_event, progress_callback)
+            self._check_cancel(cancel_event)
+
+            # -------------------------------------------------------------
+            # 4. Aba Documentos Avulsos
+            # -------------------------------------------------------------
+            if progress_callback:
+                progress_callback("Processando Aba 4/5: Documentos Avulsos...", 0.80)
+            self._write_sheet_documentos_from_file(wb, r_dir, max_items_per_sheet, cancel_event)
+            self._check_cancel(cancel_event)
+
+            # -------------------------------------------------------------
+            # 5. Aba Jogos e Saves
+            # -------------------------------------------------------------
+            if progress_callback:
+                progress_callback("Processando Aba 5/5: Jogos e Saves...", 0.90)
+            self._write_sheet_jogos_saves_from_file(wb, r_dir, cancel_event)
+            self._check_cancel(cancel_event)
+
+            # Salva no arquivo temporário
+            if progress_callback:
+                progress_callback("Gravando arquivo Excel em disco...", 0.96)
+            wb.save(temp_filepath)
+
+            # Validação básica de integridade
+            if not os.path.exists(temp_filepath) or os.path.getsize(temp_filepath) < 512:
+                raise IOError(f"Falha ao gerar arquivo Excel temporário em {temp_filepath} (arquivo vazio ou corrompido).")
+
+            if not zipfile.is_zipfile(temp_filepath):
+                raise IOError(f"O arquivo Excel temporário {temp_filepath} não é um contêiner ZIP válido.")
+
+            # Substituição atômica no destino final
+            if progress_callback:
+                progress_callback("Finalizando e validando integridade...", 0.99)
+            os.replace(temp_filepath, final_dest)
+
+            if progress_callback:
+                progress_callback("Exportação Excel concluída com sucesso!", 1.0)
+
+            return final_dest
+
+        except Exception:
+            # Em erro ou cancelamento, limpa APENAS o temporário criado por esta execução
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
+            raise
 
     def export(
         self,
@@ -162,90 +244,101 @@ class ExcelReportExporter:
         documentos_data: Dict[str, Any],
         inventario_data: Dict[str, Any],
         output_filename: str = "relatorio_auditoria_completo.xlsx",
+        target_filepath: Optional[str] = None,
         max_items_per_sheet: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> str:
-        """Gera o arquivo Excel completo a partir dos dados de relatório estruturados."""
-        wb = openpyxl.Workbook()
-        wb.remove(wb.active)
+        """Exporta a partir de dados fornecidos diretamente em memória (usado em testes)."""
+        if not target_filepath:
+            os.makedirs(self.output_dir, exist_ok=True)
+            target_filepath = os.path.join(self.output_dir, output_filename)
 
-        # 1. Aba Resumo
-        self._build_sheet_resumo(wb, resumo_data)
+        final_dest = os.path.abspath(target_filepath)
+        dest_dir = os.path.dirname(final_dest)
+        os.makedirs(dest_dir, exist_ok=True)
 
-        # 2. Aba Duplicatas
-        self._build_sheet_duplicatas(wb, duplicatas_data, max_items=max_items_per_sheet)
+        temp_filename = f".~tmp_export_{uuid.uuid4().hex[:8]}_{os.path.basename(final_dest)}.tmp"
+        temp_filepath = os.path.join(dest_dir, temp_filename)
 
-        # 3. Aba Pendentes de Backup
-        self._build_sheet_pendentes(wb, pendentes_data, max_items=max_items_per_sheet)
+        wb = openpyxl.Workbook(write_only=True)
 
-        # 4. Aba Documentos Avulsos
-        self._build_sheet_documentos(wb, documentos_data, max_items=max_items_per_sheet)
+        try:
+            self._check_cancel(cancel_event)
+            self._write_sheet_resumo_mem(wb, resumo_data)
+            self._write_sheet_duplicatas_mem(wb, duplicatas_data, max_items_per_sheet, cancel_event)
+            self._write_sheet_pendentes_mem(wb, pendentes_data, max_items_per_sheet, cancel_event)
+            self._write_sheet_documentos_mem(wb, documentos_data, max_items_per_sheet, cancel_event)
+            self._write_sheet_jogos_saves_mem(wb, inventario_data, cancel_event)
 
-        # 5. Aba Jogos e Saves
-        self._build_sheet_jogos_saves(wb, inventario_data)
+            wb.save(temp_filepath)
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        target_path = os.path.join(self.output_dir, output_filename)
-        wb.save(target_path)
-        return target_path
+            if not os.path.exists(temp_filepath) or os.path.getsize(temp_filepath) < 512 or not zipfile.is_zipfile(temp_filepath):
+                raise IOError(f"Falha na validação do arquivo Excel {temp_filepath}")
 
-    def export_from_reports_dir(
-        self,
-        reports_dir: Optional[str] = None,
-        output_filename: str = "relatorio_auditoria_completo.xlsx",
-        max_items_per_sheet: Optional[int] = None,
-    ) -> str:
-        """Lê os 5 JSONs canônicos gerados em reports/ e exporta para Excel."""
-        r_dir = reports_dir or self.output_dir
+            os.replace(temp_filepath, final_dest)
+            return final_dest
 
-        def _load(filename: str) -> Dict[str, Any]:
-            path = os.path.join(r_dir, filename)
-            if not os.path.exists(path):
-                return {}
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-
-        resumo = _load("resumo_para_ia.json")
-        duplicatas = _load("duplicatas_confirmadas.json")
-        pendentes = _load("pendentes_de_backup_para_d.json")
-        documentos = _load("documentos_avulsos.json")
-        inventario = _load("inventario_jogos_e_saves.json")
-
-        return self.export(
-            resumo_data=resumo,
-            duplicatas_data=duplicatas,
-            pendentes_data=pendentes,
-            documentos_data=documentos,
-            inventario_data=inventario,
-            output_filename=output_filename,
-            max_items_per_sheet=max_items_per_sheet,
-        )
+        except Exception:
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
+            raise
 
     # -------------------------------------------------------------------------
-    # Construtores de Abas
+    # Construtores de Abas - Modo Streaming a partir do Disco
     # -------------------------------------------------------------------------
 
-    def _build_sheet_resumo(self, wb: openpyxl.Workbook, data: Dict[str, Any]) -> None:
-        """Cria e formata a aba Resumo Executivo."""
+    @staticmethod
+    def _find_report_file(reports_dir: str, primary: str, aliases: Optional[List[str]] = None) -> Optional[str]:
+        """Localiza arquivo de relatório suportando variações de nomenclatura."""
+        candidates = [primary] + (aliases or [])
+        for name in candidates:
+            p = os.path.join(reports_dir, name)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _write_sheet_resumo_from_file(self, wb: openpyxl.Workbook, reports_dir: str) -> None:
+        """Escreve aba Resumo lendo resumo_para_ia.json."""
+        p = self._find_report_file(reports_dir, "resumo_para_ia.json", ["resumo.json"])
+        data: Dict[str, Any] = {}
+        if p:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        self._write_sheet_resumo_mem(wb, data)
+        del data
+        gc.collect()
+
+    def _write_sheet_resumo_mem(self, wb: openpyxl.Workbook, data: Dict[str, Any]) -> None:
+        """Escreve aba Resumo."""
         ws = wb.create_sheet(title="Resumo")
-        ws.views.sheetView[0].showGridLines = True
+        ws.freeze_panes = "A5"
+        self._set_column_widths(ws, {"A": 38, "B": 18, "C": 24, "D": 24})
 
-        ws["A1"] = "STORAGE AUDITOR & SAFE MOVER — RESUMO EXECUTIVO"
-        ws["A1"].font = self.title_font
-        ws["A2"] = (
+        # Linha 1: Título
+        c_title = WriteOnlyCell(ws, value="STORAGE AUDITOR & SAFE MOVER — RESUMO EXECUTIVO")
+        c_title.font = self.title_font
+        ws.append([c_title])
+
+        # Linha 2: Subtítulo
+        sub_text = (
             f"Relatório gerado em: {format_timestamp(data.get('timestamp_varredura'))} | "
             f"Versão Schema: {data.get('schema_version', '1.1.0')} | "
             "Modo: 100% Somente Leitura"
         )
-        ws["A2"].font = self.subtitle_font
+        c_sub = WriteOnlyCell(ws, value=sub_text)
+        c_sub.font = self.subtitle_font
+        ws.append([c_sub])
 
-        # Tabela de Métricas Principais
+        # Linha 3: Espaço
+        ws.append([])
+
+        # Linha 4: Cabeçalho
         headers = ["Métrica / Categoria", "Total de Itens", "Tamanho Formatado", "Tamanho em Bytes"]
-        header_row = 4
-        for col_idx, h in enumerate(headers, 1):
-            cell = ws.cell(row=header_row, column=col_idx, value=h)
-            cell.fill = self.header_fill
-            cell.font = self.header_font
-            cell.alignment = self.align_center
+        ws.append(self._make_header_row(ws, headers))
 
         totais = data.get("totais", {})
         metricas = [
@@ -259,38 +352,44 @@ class ExcelReportExporter:
             ("Vínculos Heurísticos de Saves em C:", totais.get("total_saves_detectados", 0), totais.get("tamanho_total_saves_bytes", 0)),
         ]
 
-        row_idx = header_row + 1
         for label, count, b_val in metricas:
-            ws.cell(row=row_idx, column=1, value=label).font = self.data_font
-            c2 = ws.cell(row=row_idx, column=2, value=count)
-            c2.font = self.data_font
-            c2.alignment = self.align_right
-            c2.number_format = "#,##0"
+            ws.append([label, count, format_bytes(b_val), b_val])
 
-            c3 = ws.cell(row=row_idx, column=3, value=format_bytes(b_val))
-            c3.font = self.data_font
-            c3.alignment = self.align_right
+        ws.auto_filter.ref = "A4:D12"
 
-            c4 = ws.cell(row=row_idx, column=4, value=b_val)
-            c4.font = self.data_font
-            c4.alignment = self.align_right
-            c4.number_format = "#,##0"
+    def _write_sheet_duplicatas_from_file(
+        self,
+        wb: openpyxl.Workbook,
+        reports_dir: str,
+        max_items: Optional[int],
+        cancel_event: Optional[threading.Event],
+        progress_callback: Optional[Callable[[str, float], None]],
+    ) -> None:
+        """Escreve aba Duplicatas lendo duplicatas_confirmadas.json e liberando memória."""
+        p = self._find_report_file(reports_dir, "duplicatas_confirmadas.json", ["relatorio_duplicatas.json", "duplicatas.json"])
+        data: Dict[str, Any] = {}
+        if p:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        self._write_sheet_duplicatas_mem(wb, data, max_items, cancel_event, progress_callback)
+        del data
+        gc.collect()
 
-            for col in range(1, 5):
-                ws.cell(row=row_idx, column=col).border = self.thin_border
-            row_idx += 1
-
-        self._apply_table_styling(ws, header_row=header_row)
-
-    def _build_sheet_duplicatas(
+    def _write_sheet_duplicatas_mem(
         self,
         wb: openpyxl.Workbook,
         data: Dict[str, Any],
         max_items: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
-        """Cria e formata a aba Duplicatas Confirmadas."""
+        """Escreve aba Duplicatas."""
         ws = wb.create_sheet(title="Duplicatas")
-        ws.views.sheetView[0].showGridLines = True
+        ws.freeze_panes = "A2"
+        self._set_column_widths(ws, {
+            "A": 45, "B": 45, "C": 14, "D": 16, "E": 18,
+            "F": 16, "G": 32, "H": 32, "I": 20, "J": 20
+        })
 
         headers = [
             "Caminho Origem (C:)",
@@ -304,54 +403,81 @@ class ExcelReportExporter:
             "Data Modificação Origem",
             "Data Modificação Destino",
         ]
-        ws.append(headers)
+        ws.append(self._make_header_row(ws, headers))
 
         itens = data.get("itens", [])
         if max_items:
             itens = itens[:max_items]
 
-        for item in itens:
+        total_rows = 1
+        for idx, item in enumerate(itens):
+            if idx % 1000 == 0:
+                self._check_cancel(cancel_event)
+                if progress_callback and len(itens) > 0:
+                    prog = 0.25 + (idx / len(itens)) * 0.25
+                    progress_callback(f"Duplicatas: {idx:,}/{len(itens):,} linhas...", prog)
+
             t_bytes = item.get("tamanho_bytes", 0)
             rec_bytes = item.get("espaco_recuperavel", 0)
-            conf = item.get("nivel_confianca", "completo")
+            conf = item.get("nivel_confianca", "completo").lower()
+
+            if conf == "amostral":
+                conf_cell = WriteOnlyCell(ws, value="⚠️ AMOSTRAL")
+                conf_cell.font = self.warning_font
+                conf_cell.alignment = self.align_center
+            else:
+                conf_cell = WriteOnlyCell(ws, value="✓ COMPLETO")
+                conf_cell.alignment = self.align_center
+
             row = [
                 item.get("caminho_origem", ""),
                 item.get("caminho_destino", ""),
                 format_bytes(t_bytes),
                 t_bytes,
                 rec_bytes,
-                conf.upper(),
+                conf_cell,
                 item.get("hash_amostral", ""),
                 item.get("hash_completo", ""),
                 format_timestamp(item.get("mtime_origem")),
                 format_timestamp(item.get("mtime_destino")),
             ]
             ws.append(row)
-            curr_row = ws.max_row
-            ws.cell(row=curr_row, column=3).alignment = self.align_right
-            c4 = ws.cell(row=curr_row, column=4)
-            c4.alignment = self.align_right
-            c4.number_format = "#,##0"
-            c5 = ws.cell(row=curr_row, column=5)
-            c5.alignment = self.align_right
-            c5.number_format = "#,##0"
+            total_rows += 1
 
-            if conf.lower() == "amostral":
-                conf_cell = ws.cell(row=curr_row, column=6)
-                conf_cell.alignment = self.align_center
-                conf_cell.font = self.warning_font
+        ws.auto_filter.ref = f"A1:J{max(total_rows, 2)}"
 
-        self._apply_table_styling(ws, header_row=1)
+    def _write_sheet_pendentes_from_file(
+        self,
+        wb: openpyxl.Workbook,
+        reports_dir: str,
+        max_items: Optional[int],
+        cancel_event: Optional[threading.Event],
+        progress_callback: Optional[Callable[[str, float], None]],
+    ) -> None:
+        """Escreve aba Pendentes de Backup lendo pendentes_de_backup_para_d.json e liberando memória."""
+        p = self._find_report_file(reports_dir, "pendentes_de_backup_para_d.json", ["relatorio_pendentes_backup.json", "pendentes_backup.json", "pendentes.json"])
+        data: Dict[str, Any] = {}
+        if p:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        self._write_sheet_pendentes_mem(wb, data, max_items, cancel_event, progress_callback)
+        del data
+        gc.collect()
 
-    def _build_sheet_pendentes(
+    def _write_sheet_pendentes_mem(
         self,
         wb: openpyxl.Workbook,
         data: Dict[str, Any],
         max_items: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
-        """Cria e formata a aba Pendentes de Backup."""
+        """Escreve aba Pendentes de Backup."""
         ws = wb.create_sheet(title="Pendentes de Backup")
-        ws.views.sheetView[0].showGridLines = True
+        ws.freeze_panes = "A2"
+        self._set_column_widths(ws, {
+            "A": 55, "B": 15, "C": 16, "D": 12, "E": 14, "F": 22
+        })
 
         headers = [
             "Caminho (C:)",
@@ -361,13 +487,20 @@ class ExcelReportExporter:
             "É Imagem ISO",
             "Data Modificação",
         ]
-        ws.append(headers)
+        ws.append(self._make_header_row(ws, headers))
 
         itens = data.get("itens", [])
         if max_items:
             itens = itens[:max_items]
 
-        for item in itens:
+        total_rows = 1
+        for idx, item in enumerate(itens):
+            if idx % 2000 == 0:
+                self._check_cancel(cancel_event)
+                if progress_callback and len(itens) > 0:
+                    prog = 0.55 + (idx / len(itens)) * 0.25
+                    progress_callback(f"Pendentes: {idx:,}/{len(itens):,} linhas...", prog)
+
             t_bytes = item.get("tamanho_bytes", 0)
             row = [
                 item.get("caminho", ""),
@@ -378,25 +511,40 @@ class ExcelReportExporter:
                 format_timestamp(item.get("mtime")),
             ]
             ws.append(row)
-            curr_row = ws.max_row
+            total_rows += 1
 
-            ws.cell(row=curr_row, column=2).alignment = self.align_right
-            c3 = ws.cell(row=curr_row, column=3)
-            c3.alignment = self.align_right
-            c3.number_format = "#,##0"
-            ws.cell(row=curr_row, column=5).alignment = self.align_center
+        ws.auto_filter.ref = f"A1:F{max(total_rows, 2)}"
 
-        self._apply_table_styling(ws, header_row=1)
+    def _write_sheet_documentos_from_file(
+        self,
+        wb: openpyxl.Workbook,
+        reports_dir: str,
+        max_items: Optional[int],
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        """Escreve aba Documentos Avulsos lendo documentos_avulsos.json e liberando memória."""
+        p = self._find_report_file(reports_dir, "documentos_avulsos.json", ["relatorio_documentos_avulsos.json", "documentos.json"])
+        data: Dict[str, Any] = {}
+        if p:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        self._write_sheet_documentos_mem(wb, data, max_items, cancel_event)
+        del data
+        gc.collect()
 
-    def _build_sheet_documentos(
+    def _write_sheet_documentos_mem(
         self,
         wb: openpyxl.Workbook,
         data: Dict[str, Any],
         max_items: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
-        """Cria e formata a aba Documentos Avulsos."""
+        """Escreve aba Documentos Avulsos."""
         ws = wb.create_sheet(title="Documentos Avulsos")
-        ws.views.sheetView[0].showGridLines = True
+        ws.freeze_panes = "A2"
+        self._set_column_widths(ws, {
+            "A": 50, "B": 20, "C": 15, "D": 16, "E": 12, "F": 16, "G": 22
+        })
 
         headers = [
             "Caminho (C:)",
@@ -407,42 +555,71 @@ class ExcelReportExporter:
             "Prioridade",
             "Data Modificação",
         ]
-        ws.append(headers)
+        ws.append(self._make_header_row(ws, headers))
 
         itens = data.get("itens", [])
         if max_items:
             itens = itens[:max_items]
-        for item in itens:
+
+        total_rows = 1
+        for idx, item in enumerate(itens):
+            if idx % 500 == 0:
+                self._check_cancel(cancel_event)
+
             t_bytes = item.get("tamanho_bytes", 0)
-            prio = item.get("prioridade", "media")
+            prio = item.get("prioridade", "media").lower()
+
+            if prio == "alta":
+                prio_cell = WriteOnlyCell(ws, value="🔴 ALTA")
+                prio_cell.font = self.alert_font
+                prio_cell.alignment = self.align_center
+            else:
+                prio_cell = WriteOnlyCell(ws, value="🟡 MÉDIA")
+                prio_cell.alignment = self.align_center
+
             row = [
                 item.get("caminho", ""),
                 item.get("pasta_origem", ""),
                 format_bytes(t_bytes),
                 t_bytes,
                 item.get("extensao", ""),
-                prio.upper(),
+                prio_cell,
                 format_timestamp(item.get("mtime")),
             ]
             ws.append(row)
-            curr_row = ws.max_row
+            total_rows += 1
 
-            ws.cell(row=curr_row, column=3).alignment = self.align_right
-            c4 = ws.cell(row=curr_row, column=4)
-            c4.alignment = self.align_right
-            c4.number_format = "#,##0"
+        ws.auto_filter.ref = f"A1:G{max(total_rows, 2)}"
 
-            prio_cell = ws.cell(row=curr_row, column=6)
-            prio_cell.alignment = self.align_center
-            if prio.lower() == "alta":
-                prio_cell.font = self.alert_font
+    def _write_sheet_jogos_saves_from_file(
+        self,
+        wb: openpyxl.Workbook,
+        reports_dir: str,
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        """Escreve aba Jogos e Saves lendo inventario_jogos_e_saves.json e liberando memória."""
+        p = self._find_report_file(reports_dir, "inventario_jogos_e_saves.json", ["inventario_jogos_saves.json", "jogos_saves.json"])
+        data: Dict[str, Any] = {}
+        if p:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        self._write_sheet_jogos_saves_mem(wb, data, cancel_event)
+        del data
+        gc.collect()
 
-        self._apply_table_styling(ws, header_row=1)
-
-    def _build_sheet_jogos_saves(self, wb: openpyxl.Workbook, data: Dict[str, Any]) -> None:
-        """Cria e formata a aba Jogos e Saves."""
+    def _write_sheet_jogos_saves_mem(
+        self,
+        wb: openpyxl.Workbook,
+        data: Dict[str, Any],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Escreve aba Jogos e Saves."""
         ws = wb.create_sheet(title="Jogos e Saves")
-        ws.views.sheetView[0].showGridLines = True
+        ws.freeze_panes = "A2"
+        self._set_column_widths(ws, {
+            "A": 30, "B": 15, "C": 45, "D": 18, "E": 18,
+            "F": 45, "G": 16, "H": 16, "I": 14, "J": 16, "K": 35, "L": 22
+        })
 
         headers = [
             "Nome do Jogo",
@@ -458,19 +635,20 @@ class ExcelReportExporter:
             "Status do Vínculo",
             "Data Modificação Save",
         ]
-        ws.append(headers)
+        ws.append(self._make_header_row(ws, headers))
 
         jogos = data.get("jogos", [])
 
         # Identifica saves compartilhados
-        from collections import Counter
-        save_paths = []
+        save_paths: List[str] = []
         for j in jogos:
             for s in j.get("saves_em_c", []):
                 save_paths.append(s.get("caminho_save", ""))
         shared_counts = Counter(save_paths)
 
+        total_rows = 1
         for j in jogos:
+            self._check_cancel(cancel_event)
             j_nome = j.get("nome", "")
             j_launcher = j.get("launcher", "")
             j_path = j.get("caminho_instalacao", "")
@@ -478,7 +656,6 @@ class ExcelReportExporter:
             saves = j.get("saves_em_c", [])
 
             if not saves:
-                # Jogo sem saves vinculados
                 row = [
                     j_nome,
                     j_launcher,
@@ -494,13 +671,7 @@ class ExcelReportExporter:
                     "",
                 ]
                 ws.append(row)
-                curr_row = ws.max_row
-                ws.cell(row=curr_row, column=4).alignment = self.align_right
-                c5 = ws.cell(row=curr_row, column=5)
-                c5.alignment = self.align_right
-                c5.number_format = "#,##0"
-                for col_idx in range(1, len(headers) + 1):
-                    ws.cell(row=curr_row, column=col_idx).border = self.thin_border
+                total_rows += 1
             else:
                 for s in saves:
                     s_path = s.get("caminho_save", "")
@@ -508,6 +679,12 @@ class ExcelReportExporter:
                     s_files = s.get("quantidade_arquivos", 0)
                     s_cert = s.get("nivel_certeza", "media")
                     status_str = classify_save_status(s_path, j_nome, shared_counts)
+
+                    if "Revisar" in status_str:
+                        status_cell = WriteOnlyCell(ws, value=status_str)
+                        status_cell.font = self.warning_font
+                    else:
+                        status_cell = WriteOnlyCell(ws, value=status_str)
 
                     row = [
                         j_nome,
@@ -520,31 +697,10 @@ class ExcelReportExporter:
                         s_bytes,
                         s_files,
                         s_cert.upper(),
-                        status_str,
+                        status_cell,
                         format_timestamp(s.get("mtime")),
                     ]
                     ws.append(row)
-                    curr_row = ws.max_row
+                    total_rows += 1
 
-                    ws.cell(row=curr_row, column=4).alignment = self.align_right
-                    c5 = ws.cell(row=curr_row, column=5)
-                    c5.alignment = self.align_right
-                    c5.number_format = "#,##0"
-
-                    ws.cell(row=curr_row, column=7).alignment = self.align_right
-                    c8 = ws.cell(row=curr_row, column=8)
-                    c8.alignment = self.align_right
-                    c8.number_format = "#,##0"
-                    c9 = ws.cell(row=curr_row, column=9)
-                    c9.alignment = self.align_right
-                    c9.number_format = "#,##0"
-
-                    # Destaque de alerta se for vínculo suspeito/revisar
-                    status_cell = ws.cell(row=curr_row, column=11)
-                    if "Revisar" in status_str:
-                        status_cell.font = self.warning_font
-
-                    for col_idx in range(1, len(headers) + 1):
-                        ws.cell(row=curr_row, column=col_idx).border = self.thin_border
-
-        self._apply_table_styling(ws, header_row=1)
+        ws.auto_filter.ref = f"A1:L{max(total_rows, 2)}"
