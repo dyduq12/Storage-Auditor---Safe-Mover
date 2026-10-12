@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config import FILE_ATTRIBUTE_REPARSE_POINT, SYSTEM_DIR_NAMES
+from core.path_utils import to_extended_path
 
 ACTION_PLAN_SCHEMA_VERSION: str = "1.0.0"
 DEFAULT_SAFETY_MARGIN_BYTES: int = 2 * 1024 * 1024 * 1024  # 2.0 GB de margem livre
@@ -199,11 +200,12 @@ class ActionPlanGenerator:
     def is_reparse_point_or_symlink(path: str) -> bool:
         """Detecta se o arquivo/diretório é um symlink, junction ou reparse point no Windows."""
         try:
-            if os.path.islink(path):
+            path_ext = to_extended_path(path)
+            if os.path.islink(path_ext):
                 return True
-            if os.name == "nt" and os.path.exists(path):
+            if os.name == "nt" and os.path.exists(path_ext):
                 import ctypes
-                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path_ext))
                 if attrs != -1 and (attrs & FILE_ATTRIBUTE_REPARSE_POINT):
                     return True
         except Exception:
@@ -427,8 +429,11 @@ class ActionPlanGenerator:
 
             # 6. Validação ao vivo no filesystem (se habilitada)
             if validate_live_filesystem:
+                tgt_ext = to_extended_path(tgt)
+                src_ext = to_extended_path(src_norm)
+
                 # Checa destino existente
-                if os.path.exists(tgt):
+                if os.path.exists(tgt_ext):
                     ordens_recusadas.append({
                         "caminho_origem": src_norm,
                         "caminho_destino": tgt,
@@ -440,7 +445,7 @@ class ActionPlanGenerator:
                     return
 
                 # Checa existência da origem
-                if not os.path.exists(src_norm):
+                if not os.path.exists(src_ext):
                     ordens_recusadas.append({
                         "caminho_origem": src_norm,
                         "caminho_destino": tgt,
@@ -453,7 +458,7 @@ class ActionPlanGenerator:
 
                 # Checa mutação da origem pós-auditoria
                 try:
-                    st = os.stat(src_norm)
+                    st = os.stat(src_ext)
                     if st.st_size != size:
                         ordens_recusadas.append({
                             "caminho_origem": src_norm,
@@ -479,8 +484,8 @@ class ActionPlanGenerator:
                         "caminho_origem": src_norm,
                         "caminho_destino": tgt,
                         "tamanho_bytes": size,
-                        "motivo_recusa": f"Erro de I/O ao verificar origem: {e}",
-                        "categoria": "erro_origem",
+                        "motivo_recusa": f"Falha ao inspecionar origem no filesystem: {e}",
+                        "categoria": "origem_mutada",
                     })
                     caminhos_processados.add(src_lower)
                     return

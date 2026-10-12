@@ -24,6 +24,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.action_plan import ActionOrder, ActionPlan
+from core.path_utils import to_extended_path, from_extended_path
 
 
 class SafeMoverError(Exception):
@@ -68,17 +69,19 @@ class SafeCopyExecutor:
         log_dir: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        custom_log_filename: Optional[str] = None,
+        max_consecutive_failures: int = 0,
     ) -> None:
         self.plan = plan
         self.log_dir = os.path.abspath(log_dir or plan.source_reports_dir)
         self.cancel_event = cancel_event
         self.progress_callback = progress_callback
+        self.max_consecutive_failures = max_consecutive_failures
+        self.consecutive_failures = 0
 
         os.makedirs(self.log_dir, exist_ok=True)
-        self.log_file_path = os.path.join(
-            self.log_dir,
-            f"execution_log_{plan.plan_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-        )
+        log_name = custom_log_filename or f"execution_log_{plan.plan_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+        self.log_file_path = os.path.join(self.log_dir, log_name)
 
         self.total_orders = len(plan.ordens)
         self.completed_orders = sum(1 for o in plan.ordens if o.status in ("completed", "already_completed"))
@@ -131,9 +134,9 @@ class SafeCopyExecutor:
 
     @staticmethod
     def compute_sha256(filepath: str) -> str:
-        """Calcula o hash SHA-256 completo de um arquivo local."""
+        """Calcula o hash SHA-256 completo de um arquivo local com suporte a caminhos longos."""
         h = hashlib.sha256()
-        with open(filepath, "rb") as f:
+        with open(to_extended_path(filepath), "rb") as f:
             while True:
                 chunk = f.read(BUFFER_SIZE)
                 if not chunk:
@@ -145,11 +148,13 @@ class SafeCopyExecutor:
         """Verifica se o destino já existe e é idêntico à origem (suporte à retomada/resume)."""
         tgt = order.target_path
         src = order.source_path
-        if not os.path.exists(tgt) or not os.path.exists(src):
+        tgt_ext = to_extended_path(tgt)
+        src_ext = to_extended_path(src)
+        if not os.path.exists(tgt_ext) or not os.path.exists(src_ext):
             return False
 
         try:
-            if os.path.getsize(tgt) != order.expected_size_bytes:
+            if os.path.getsize(tgt_ext) != order.expected_size_bytes:
                 return False
             tgt_sha = self.compute_sha256(tgt)
             expected_sha = order.expected_sha256 or self.compute_sha256(src)
@@ -163,20 +168,22 @@ class SafeCopyExecutor:
         return False
 
     def preflight_order(self, order: ActionOrder) -> Tuple[bool, str]:
-        """Revalidação estrita prévia da ordem imediatamente antes da cópia."""
+        """Revalidação estrita prévia da ordem imediatamente antes da cópia com suporte a caminhos longos."""
         src = order.source_path
         tgt = order.target_path
+        src_ext = to_extended_path(src)
+        tgt_ext = to_extended_path(tgt)
 
         # 1. Origem deve existir e ser um arquivo regular
-        if not os.path.exists(src):
+        if not os.path.exists(src_ext):
             return False, f"Origem não existe: '{src}'"
 
-        if not os.path.isfile(src) or os.path.islink(src):
+        if not os.path.isfile(src_ext) or os.path.islink(src_ext):
             return False, f"Origem não é um arquivo regular: '{src}'"
 
         # 2. Revalida tamanho e mtime com a auditoria
         try:
-            st = os.stat(src)
+            st = os.stat(src_ext)
             current_size = st.st_size
             current_mtime = st.st_mtime
         except OSError as e:
@@ -189,7 +196,7 @@ class SafeCopyExecutor:
             return False, f"Data de modificação da origem foi alterada (esperado: {order.expected_mtime}, atual: {current_mtime})"
 
         # 3. Destino NUNCA pode existir previamente
-        if os.path.exists(tgt):
+        if os.path.exists(tgt_ext):
             return False, f"Destino já existe. Sobrescrita terminantemente proibida: '{tgt}'"
 
         return True, ""
@@ -219,10 +226,11 @@ class SafeCopyExecutor:
             self._log_event("PREFLIGHT_FAILED", order=order, error=err_msg)
             return
 
-        # 2. Prepara diretório de destino e nome temporário exclusivo
+        # 2. Prepara diretório de destino e nome temporário exclusivo curto (economiza ~55 caracteres)
         dest_dir = os.path.dirname(order.target_path)
+        dest_dir_ext = to_extended_path(dest_dir)
         try:
-            os.makedirs(dest_dir, exist_ok=True)
+            os.makedirs(dest_dir_ext, exist_ok=True)
         except OSError as e:
             order.status = "failed"
             order.error = f"Falha ao criar diretório de destino: {e}"
@@ -230,17 +238,20 @@ class SafeCopyExecutor:
             self._log_event("MKDIR_FAILED", order=order, error=str(e))
             return
 
-        temp_filename = f".~tmp_safecopy_{order.order_id}_{uuid.uuid4().hex[:8]}.tmp"
+        temp_filename = f".~tmp_safecopy_{uuid.uuid4().hex[:8]}.tmp"
         temp_path = os.path.join(dest_dir, temp_filename)
+        temp_path_ext = to_extended_path(temp_path)
+        src_ext = to_extended_path(order.source_path)
+        tgt_ext = to_extended_path(order.target_path)
 
         hasher_src = hashlib.sha256()
         hasher_dst = hashlib.sha256()
         bytes_this_order = 0
 
         try:
-            # 3. Cópia em blocos com hashing dual simultâneo
-            with open(order.source_path, "rb") as f_src:
-                with open(temp_path, "wb") as f_dst:
+            # 3. Cópia em blocos com hashing dual simultâneo e suporte a caminhos longos
+            with open(src_ext, "rb") as f_src:
+                with open(temp_path_ext, "wb") as f_dst:
                     while True:
                         if self.cancel_event and self.cancel_event.is_set():
                             raise CopyCancelledError("Cópia cancelada cooperativamente pelo usuário.")
@@ -261,7 +272,7 @@ class SafeCopyExecutor:
             if self.cancel_event and self.cancel_event.is_set():
                 raise CopyCancelledError("Cópia cancelada após gravação de blocos.")
 
-            temp_size = os.path.getsize(temp_path)
+            temp_size = os.path.getsize(temp_path_ext)
             if temp_size != order.expected_size_bytes:
                 raise IOError(f"Tamanho gravado divergente: esperado {order.expected_size_bytes}, obtido {temp_size}")
 
@@ -275,12 +286,12 @@ class SafeCopyExecutor:
                 raise HashMismatchError(f"Hash calculado ({src_hash}) diverge do hash prévio do plano ({order.expected_sha256})")
 
             # 5. Verificação final de não-concorrência de destino antes da renomeação
-            if os.path.exists(order.target_path):
+            if os.path.exists(tgt_ext):
                 raise TargetConflictError(f"Destino apareceu durante a cópia: '{order.target_path}'")
 
             # 6. Renomeação atômica
             # os.rename no Windows falha se o destino existir (proteção nativa)
-            os.rename(temp_path, order.target_path)
+            os.rename(temp_path_ext, tgt_ext)
 
             duration = (time.time() - t_start) * 1000
             order.status = "completed"
@@ -299,9 +310,9 @@ class SafeCopyExecutor:
 
         except CopyCancelledError:
             # Em cancelamento: limpa SOMENTE o temporário, preserva a origem intacta
-            if os.path.exists(temp_path):
+            if os.path.exists(temp_path_ext):
                 try:
-                    os.remove(temp_path)
+                    os.remove(temp_path_ext)
                 except OSError:
                     pass
             order.status = "cancelled"
@@ -312,15 +323,16 @@ class SafeCopyExecutor:
 
         except Exception as e:
             # Em erro: limpa SOMENTE o temporário, preserva a origem intacta
-            if os.path.exists(temp_path):
+            if os.path.exists(temp_path_ext):
                 try:
-                    os.remove(temp_path)
+                    os.remove(temp_path_ext)
                 except OSError:
                     pass
             order.status = "failed"
             order.error = str(e)
             self.failed_orders += 1
             self._log_event("FAILED", order=order, error=str(e))
+
 
     def execute_all(self) -> Dict[str, Any]:
         """Executa todas as ordens pendentes do plano em sequência estritamente não-destrutiva."""
@@ -362,6 +374,15 @@ class SafeCopyExecutor:
                 self._report_progress(order, "running")
                 self.copy_single_order(order)
                 self._report_progress(order, "step")
+
+                if order.status in ("completed", "already_completed"):
+                    self.consecutive_failures = 0
+                else:
+                    self.consecutive_failures += 1
+                    if self.max_consecutive_failures > 0 and self.consecutive_failures >= self.max_consecutive_failures:
+                        err_abort = f"Execução abortada automaticamente: atingido o limite de {self.max_consecutive_failures} falhas consecutivas."
+                        self._log_event("MAX_CONSECUTIVE_FAILURES_ABORT", error=err_abort)
+                        raise SafeMoverError(err_abort)
 
         except CopyCancelledError:
             self._log_event("PLAN_EXECUTION_CANCELLED")
