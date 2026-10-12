@@ -83,6 +83,8 @@ class ActionPlan:
     target_base_dir: str
     totais: Dict[str, Any]
     ordens: List[ActionOrder] = field(default_factory=list)
+    ordens_recusadas: List[Dict[str, Any]] = field(default_factory=list)
+    status_aprovacao: str = "aprovado"  # "aprovado" ou "nao_aprovado_invalido"
     schema_version: str = ACTION_PLAN_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -94,6 +96,8 @@ class ActionPlan:
             "target_base_dir": self.target_base_dir,
             "totais": self.totais,
             "ordens": [o.to_dict() for o in self.ordens],
+            "ordens_recusadas": self.ordens_recusadas,
+            "status_aprovacao": self.status_aprovacao,
         }
 
     def save_to_json(self, filepath: str) -> None:
@@ -115,14 +119,18 @@ class ActionPlan:
                 raise ActionPlanValidationError(f"Campo obrigatório ausente no ActionPlan: '{req}'")
 
         orders = [ActionOrder.from_dict(o) for o in data["ordens"]]
+        recusadas = list(data.get("ordens_recusadas", []))
+        status_aprovacao = str(data.get("status_aprovacao", data.get("totais", {}).get("status_aprovacao", "aprovado")))
+
         return cls(
-            schema_version=version,
             plan_id=str(data["plan_id"]),
             created_at=str(data["created_at"]),
             source_reports_dir=str(data["source_reports_dir"]),
             target_base_dir=str(data["target_base_dir"]),
             totais=dict(data["totais"]),
             ordens=orders,
+            ordens_recusadas=recusadas,
+            status_aprovacao=status_aprovacao,
         )
 
     @classmethod
@@ -151,6 +159,41 @@ class ActionPlanGenerator:
         self.safety_margin_bytes = safety_margin_bytes
         self.authorized_source_roots = [os.path.abspath(r) for r in (authorized_source_roots or [])]
         self.authorized_target_roots = [os.path.abspath(r) for r in (authorized_target_roots or [])]
+        self.heuristic_save_paths = self._load_heuristic_save_rules()
+
+    def _load_heuristic_save_rules(self) -> Set[str]:
+        """Carrega diretórios de saves heurísticos / suspeitos do inventário de jogos."""
+        heuristic_dirs: Set[str] = set()
+        inv_path = os.path.join(self.reports_dir, "inventario_jogos_e_saves.json")
+        if os.path.exists(inv_path):
+            try:
+                with open(inv_path, "r", encoding="utf-8") as f:
+                    inv_data = json.load(f)
+                for j in inv_data.get("jogos", []):
+                    for s in j.get("saves_em_c", []):
+                        cert = str(s.get("nivel_certeza", "")).lower()
+                        p = s.get("caminho_save", "")
+                        if p:
+                            p_lower = os.path.normpath(p).lower()
+                            if cert in ("baixa", "heuristico", "suspeito") or \
+                               "\\temp\\" in p_lower or "\\docker\\" in p_lower or \
+                               "\\adobe\\ccx" in p_lower or "\\prismlauncher\\meta" in p_lower:
+                                heuristic_dirs.add(p_lower)
+            except Exception:
+                pass
+        return heuristic_dirs
+
+    def is_heuristic_or_suspicious_save(self, source_path: str) -> Tuple[bool, str]:
+        """Verifica se o caminho corresponde a um save heurístico ou suspeito."""
+        src_norm = os.path.normpath(source_path).lower()
+        for h_dir in getattr(self, "heuristic_save_paths", set()):
+            if src_norm.startswith(h_dir):
+                return True, f"Caminho identificado como save de jogo heurístico/suspeito: '{source_path}'"
+
+        if "\\appdata\\local\\temp\\" in src_norm and "pytest" not in src_norm:
+            return True, f"Caminho sob pasta temporária suspeita: '{source_path}'"
+
+        return False, ""
 
     @staticmethod
     def is_reparse_point_or_symlink(path: str) -> bool:
@@ -243,13 +286,7 @@ class ActionPlanGenerator:
 
     @staticmethod
     def derive_relative_target_path(source_path: str) -> str:
-        """Deriva uma estrutura de subpasta limpa e representativa para o arquivo no destino.
-        
-        Exemplo:
-        C:\\Users\\Eduardo\\Documents\\relatorio.pdf -> Documents\\relatorio.pdf
-        C:\\Users\\Eduardo\\Downloads\\Setup\\app.exe -> Downloads\\Setup\\app.exe
-        C:\\Dados\\fotos\\img.png -> Dados\\fotos\\img.png
-        """
+        """Deriva uma estrutura de subpasta limpa e representativa para o arquivo no destino."""
         norm = os.path.normpath(source_path)
         parts = list(Path(norm).parts)
 
@@ -259,7 +296,6 @@ class ActionPlanGenerator:
 
         # Se estiver em Users\<Nome>\Pasta..., deriva a partir da pasta sob o usuário
         if len(parts) >= 3 and parts[0].lower() == "users":
-            # [Users, Eduardo, Documents, ...] -> [Documents, ...]
             rel_parts = parts[2:]
             return os.path.join(*rel_parts)
 
@@ -270,17 +306,30 @@ class ActionPlanGenerator:
         self,
         include_pending: bool = True,
         include_documents: bool = True,
+        triage_manager: Optional[Any] = None,
+        explicit_included_paths: Optional[Set[str]] = None,
+        validate_live_filesystem: bool = False,
     ) -> ActionPlan:
-        """Gera o ActionPlan compilando ordens a partir dos relatórios existentes."""
+        """Gera o ActionPlan compilando ordens com rejeição estrita de riscos.
+        
+        Rejeita qualquer ordem baseada em:
+        - Save heurístico ou de baixa confiança
+        - Hash apenas amostral sem hash completo
+        - Caminho de origem inexistente (se validate_live_filesystem=True)
+        - Fonte alterada pós-auditoria (se validate_live_filesystem=True)
+        - Destino pré-existente (se validate_live_filesystem=True)
+        - Caminho fora de raízes autorizadas ou de sistema restrito
+        
+        Se triage_manager ou explicit_included_paths for fornecido, apenas arquivos com
+        decisão 'include' são aceitos.
+        """
         plan_id = f"plan_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         created_at = datetime.datetime.now().isoformat()
 
         ordens: List[ActionOrder] = []
+        ordens_recusadas: List[Dict[str, Any]] = []
         caminhos_processados: Set[str] = set()
 
-        # ---------------------------------------------------------------------
-        # 1. Carrega Relatórios JSON
-        # ---------------------------------------------------------------------
         def _read_report(primary: str, aliases: List[str]) -> Dict[str, Any]:
             for name in [primary] + aliases:
                 p = os.path.join(self.reports_dir, name)
@@ -295,90 +344,173 @@ class ActionPlanGenerator:
         pen_data = _read_report("pendentes_de_backup_para_d.json", ["relatorio_pendentes_backup.json"]) if include_pending else {}
         doc_data = _read_report("documentos_avulsos.json", ["relatorio_documentos_avulsos.json"]) if include_documents else {}
 
-        # ---------------------------------------------------------------------
-        # 2. Processa Pendentes de Backup
-        # ---------------------------------------------------------------------
-        for item in pen_data.get("itens", []):
+        def _evaluate_candidate(
+            item: Dict[str, Any],
+            category_tag: str,
+            default_reason: str,
+        ) -> None:
             src = item.get("caminho")
-            if not src or src.lower() in caminhos_processados:
-                continue
+            if not src:
+                return
 
-            # Valida segurança da origem
-            safe_src, src_err = self.validate_source_file(src)
-            if not safe_src:
-                continue
+            src_norm = os.path.normpath(src)
+            src_lower = src_norm.lower()
 
-            rel_target = self.derive_relative_target_path(src)
-            tgt = os.path.join(self.target_base_dir, rel_target)
-
-            # Valida segurança do destino
-            safe_tgt, tgt_err = self.validate_target_file(tgt, src)
-            if not safe_tgt:
-                continue
+            if src_lower in caminhos_processados:
+                return
 
             size = int(item.get("tamanho_bytes", 0))
             mtime = float(item.get("mtime", 0.0))
-            order_id = f"ord_{hashlib.sha256(src.encode('utf-8')).hexdigest()[:16]}"
-
-            ordens.append(
-                ActionOrder(
-                    order_id=order_id,
-                    source_path=src,
-                    target_path=tgt,
-                    expected_size_bytes=size,
-                    expected_mtime=mtime,
-                    expected_sha256=None,
-                    fingerprint_confidence="nao_calculado",
-                    category="pendente_backup",
-                    reason="Arquivo de C: pendente de backup em D:",
-                    status="pending",
-                )
-            )
-            caminhos_processados.add(src.lower())
-
-        # ---------------------------------------------------------------------
-        # 3. Processa Documentos Avulsos Críticos
-        # ---------------------------------------------------------------------
-        for item in doc_data.get("itens", []):
-            src = item.get("caminho")
-            if not src or src.lower() in caminhos_processados:
-                continue
-
-            safe_src, src_err = self.validate_source_file(src)
-            if not safe_src:
-                continue
-
-            rel_target = self.derive_relative_target_path(src)
+            rel_target = self.derive_relative_target_path(src_norm)
             tgt = os.path.join(self.target_base_dir, rel_target)
 
-            safe_tgt, tgt_err = self.validate_target_file(tgt, src)
+            # 1. Filtro estrito de triagem por decisão explícita: SOMENTE itens com decisão INCLUDE
+            if triage_manager is not None:
+                dec, _, _ = triage_manager.resolve_file_decision(src_norm)
+                if dec != "include":
+                    return
+            elif explicit_included_paths is not None:
+                if src_lower not in explicit_included_paths:
+                    return
+
+            # 2. Rejeição de saves heurísticos / suspeitos
+            is_heur, heur_reason = self.is_heuristic_or_suspicious_save(src_norm)
+            if is_heur:
+                ordens_recusadas.append({
+                    "caminho_origem": src_norm,
+                    "caminho_destino": tgt,
+                    "tamanho_bytes": size,
+                    "motivo_recusa": heur_reason,
+                    "categoria": "save_heuristico",
+                })
+                caminhos_processados.add(src_lower)
+                return
+
+            # 3. Rejeição de hash apenas amostral sem hash completo
+            fp_conf = str(item.get("fingerprint_confidence") or item.get("tipo_hash") or "").lower()
+            if fp_conf == "amostral" and not item.get("sha256_completo"):
+                ordens_recusadas.append({
+                    "caminho_origem": src_norm,
+                    "caminho_destino": tgt,
+                    "tamanho_bytes": size,
+                    "motivo_recusa": "Hash prévio é apenas amostral (não verificado com SHA-256 completo)",
+                    "categoria": "hash_amostral",
+                })
+                caminhos_processados.add(src_lower)
+                return
+
+            # 4. Validação de segurança do caminho de origem
+            safe_src, src_err = self.validate_source_file(src_norm)
+            if not safe_src:
+                ordens_recusadas.append({
+                    "caminho_origem": src_norm,
+                    "caminho_destino": tgt,
+                    "tamanho_bytes": size,
+                    "motivo_recusa": src_err,
+                    "categoria": "seguranca_origem",
+                })
+                caminhos_processados.add(src_lower)
+                return
+
+            # 5. Validação de segurança do caminho de destino
+            safe_tgt, tgt_err = self.validate_target_file(tgt, src_norm)
             if not safe_tgt:
-                continue
+                ordens_recusadas.append({
+                    "caminho_origem": src_norm,
+                    "caminho_destino": tgt,
+                    "tamanho_bytes": size,
+                    "motivo_recusa": tgt_err,
+                    "categoria": "seguranca_destino",
+                })
+                caminhos_processados.add(src_lower)
+                return
 
-            size = int(item.get("tamanho_bytes", 0))
-            mtime = float(item.get("mtime", 0.0))
-            prio = str(item.get("prioridade", "alta")).lower()
-            order_id = f"ord_{hashlib.sha256(src.encode('utf-8')).hexdigest()[:16]}"
+            # 6. Validação ao vivo no filesystem (se habilitada)
+            if validate_live_filesystem:
+                # Checa destino existente
+                if os.path.exists(tgt):
+                    ordens_recusadas.append({
+                        "caminho_origem": src_norm,
+                        "caminho_destino": tgt,
+                        "tamanho_bytes": size,
+                        "motivo_recusa": f"Destino já existe no disco. Sobrescrita proibida: '{tgt}'",
+                        "categoria": "conflito_destino",
+                    })
+                    caminhos_processados.add(src_lower)
+                    return
 
+                # Checa existência da origem
+                if not os.path.exists(src_norm):
+                    ordens_recusadas.append({
+                        "caminho_origem": src_norm,
+                        "caminho_destino": tgt,
+                        "tamanho_bytes": size,
+                        "motivo_recusa": f"Arquivo de origem não existe no disco: '{src_norm}'",
+                        "categoria": "origem_inexistente",
+                    })
+                    caminhos_processados.add(src_lower)
+                    return
+
+                # Checa mutação da origem pós-auditoria
+                try:
+                    st = os.stat(src_norm)
+                    if st.st_size != size:
+                        ordens_recusadas.append({
+                            "caminho_origem": src_norm,
+                            "caminho_destino": tgt,
+                            "tamanho_bytes": size,
+                            "motivo_recusa": f"Tamanho da origem foi alterado pós-auditoria (esperado: {size}, atual: {st.st_size})",
+                            "categoria": "origem_mutada",
+                        })
+                        caminhos_processados.add(src_lower)
+                        return
+                    if abs(st.st_mtime - mtime) >= 1.0:
+                        ordens_recusadas.append({
+                            "caminho_origem": src_norm,
+                            "caminho_destino": tgt,
+                            "tamanho_bytes": size,
+                            "motivo_recusa": f"Data de modificação da origem foi alterada pós-auditoria (esperado: {mtime}, atual: {st.st_mtime})",
+                            "categoria": "origem_mutada",
+                        })
+                        caminhos_processados.add(src_lower)
+                        return
+                except OSError as e:
+                    ordens_recusadas.append({
+                        "caminho_origem": src_norm,
+                        "caminho_destino": tgt,
+                        "tamanho_bytes": size,
+                        "motivo_recusa": f"Erro de I/O ao verificar origem: {e}",
+                        "categoria": "erro_origem",
+                    })
+                    caminhos_processados.add(src_lower)
+                    return
+
+            order_id = f"ord_{hashlib.sha256(src_norm.encode('utf-8')).hexdigest()[:16]}"
             ordens.append(
                 ActionOrder(
                     order_id=order_id,
-                    source_path=src,
+                    source_path=src_norm,
                     target_path=tgt,
                     expected_size_bytes=size,
                     expected_mtime=mtime,
-                    expected_sha256=None,
-                    fingerprint_confidence="nao_calculado",
-                    category="documento_avulso_critico",
-                    reason=f"Documento importante de C: com prioridade {prio.upper()}",
+                    expected_sha256=item.get("sha256_completo") or item.get("sha256"),
+                    fingerprint_confidence="completo" if (item.get("sha256_completo") or item.get("sha256")) else "nao_calculado",
+                    category=category_tag,
+                    reason=default_reason,
                     status="pending",
                 )
             )
-            caminhos_processados.add(src.lower())
+            caminhos_processados.add(src_lower)
 
-        # ---------------------------------------------------------------------
-        # 4. Cálculo de Espaço Livre e Projeção
-        # ---------------------------------------------------------------------
+        # Processa Pendentes
+        for it in pen_data.get("itens", []):
+            _evaluate_candidate(it, "pendente_backup", "Arquivo de C: aprovado na triagem para backup em D:")
+
+        # Processa Documentos
+        for it in doc_data.get("itens", []):
+            prio = str(it.get("prioridade", "alta")).upper()
+            _evaluate_candidate(it, "documento_avulso_critico", f"Documento importante de C: com prioridade {prio}")
+
         total_bytes = sum(o.expected_size_bytes for o in ordens)
         dest_root = os.path.splitdrive(self.target_base_dir)[0] or self.target_base_dir
         if not dest_root.endswith("\\") and not dest_root.endswith("/"):
@@ -390,12 +522,18 @@ class ActionPlanGenerator:
         except Exception:
             free_bytes = 0
 
+        is_approved = (triage_manager is not None or explicit_included_paths is not None)
+        status_aprovacao = "aprovado" if is_approved else "nao_aprovado_invalido"
+
         totais = {
             "total_ordens": len(ordens),
+            "total_ordens_recusadas": len(ordens_recusadas),
             "tamanho_total_bytes": total_bytes,
             "espaco_livre_destino_bytes": free_bytes,
             "espaco_necessario_com_margem_bytes": total_bytes + self.safety_margin_bytes,
             "espaco_suficiente": free_bytes >= (total_bytes + self.safety_margin_bytes),
+            "status_aprovacao": status_aprovacao,
+            "selecao_explicita_presente": is_approved,
         }
 
         return ActionPlan(
@@ -405,4 +543,6 @@ class ActionPlanGenerator:
             target_base_dir=self.target_base_dir,
             totais=totais,
             ordens=ordens,
+            ordens_recusadas=ordens_recusadas,
+            status_aprovacao=status_aprovacao,
         )

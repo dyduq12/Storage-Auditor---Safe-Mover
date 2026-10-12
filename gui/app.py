@@ -242,13 +242,11 @@ class StorageAuditorApp(ctk.CTk):
         )
         self.lbl_progress_status.pack(anchor="w")
 
-        # -------------------------------------------------------------
-        # 3. Notebook de Abas
-        # -------------------------------------------------------------
-        self.tabview = ctk.CTkTabview(self, corner_radius=8)
+        self.tabview = ctk.CTkTabview(self, corner_radius=8, command=self._on_tab_changed)
         self.tabview.grid(row=2, column=0, sticky="nsew", padx=15, pady=5)
 
         tab_resumo = self.tabview.add("Resumo")
+
         tab_duplicatas = self.tabview.add("Duplicatas")
         tab_pendentes = self.tabview.add("Pendentes de Backup")
         tab_documentos = self.tabview.add("Documentos Avulsos")
@@ -474,12 +472,26 @@ class StorageAuditorApp(ctk.CTk):
         self._refresh_all_views()
 
     def _refresh_all_views(self) -> None:
-        """Atualiza todas as 5 abas com os dados atuais."""
+        """Atualiza todas as abas com os dados atuais."""
         self.view_summary.refresh_view()
         self.view_duplicates.refresh_view()
         self.view_pending.refresh_view()
         self.view_documents.refresh_view()
         self.view_games.refresh_view()
+        if hasattr(self, "view_safemover"):
+            self.view_safemover.refresh_view()
+
+
+    def _on_tab_changed(self) -> None:
+        """Gerencia visibilidade dos painéis superiores para maximizar espaço da área de trabalho."""
+        selected = self.tabview.get()
+        if selected == "Plano de Cópia Segura":
+            self.config_panel.grid_remove()
+            if hasattr(self, "view_safemover"):
+                self.view_safemover.refresh_view()
+        else:
+            self.config_panel.grid()
+
 
     def _export_excel(self) -> None:
         """Dispara a exportação para planilha Excel (.xlsx) em thread separada com streaming de baixo consumo."""

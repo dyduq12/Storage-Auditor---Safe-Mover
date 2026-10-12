@@ -33,16 +33,25 @@ class AuditDataLoader:
     def load_from_directory(self, reports_dir: Optional[str] = None) -> bool:
         """Carrega e valida os cinco arquivos JSON da pasta especificada."""
         target_dir = reports_dir or self.reports_dir
-        self.reports_dir = target_dir
+
+        # Se for caminho relativo, tenta resolver primeiro contra CWD e depois contra a raiz do projeto
+        if not os.path.isabs(target_dir):
+            if not os.path.exists(target_dir):
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                candidate = os.path.join(project_root, target_dir)
+                if os.path.exists(candidate):
+                    target_dir = candidate
+
+        self.reports_dir = os.path.abspath(target_dir)
         self.last_load_error = None
 
-        if not os.path.exists(target_dir):
-            self.last_load_error = f"Diretório de relatórios não existe: '{target_dir}'"
+        if not os.path.exists(self.reports_dir):
+            self.last_load_error = f"Diretório de relatórios não existe: '{self.reports_dir}'"
             self.is_loaded = False
             return False
 
         def _read_json(fname: str) -> Dict[str, Any]:
-            p = os.path.join(target_dir, fname)
+            p = os.path.join(self.reports_dir, fname)
             if not os.path.exists(p):
                 return {}
             try:
@@ -56,6 +65,9 @@ class AuditDataLoader:
         pen_json = _read_json("pendentes_de_backup_para_d.json")
         doc_json = _read_json("documentos_avulsos.json")
         inv_json = _read_json("inventario_jogos_e_saves.json")
+
+        if not pen_json and not os.path.exists(os.path.join(self.reports_dir, "pendentes_de_backup_para_d.json")):
+            self.last_load_error = f"Arquivo 'pendentes_de_backup_para_d.json' não encontrado em: '{self.reports_dir}'"
 
         self.duplicatas = dup_json.get("itens", []) if isinstance(dup_json, dict) else []
         self.pendentes = pen_json.get("itens", []) if isinstance(pen_json, dict) else []
