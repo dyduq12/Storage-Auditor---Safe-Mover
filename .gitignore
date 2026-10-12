@@ -126,3 +126,6 @@ $RECYCLE.BIN/
 
 # Scripts utilitários de validação local de relatórios
 validate_reports.py
+
+# Documentos internos retidos (não publicar por enquanto)
+docs/spec_extracted.txt

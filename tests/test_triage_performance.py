@@ -91,8 +91,8 @@ def test_decision_latency_with_large_dataset():
 
     tm = TriageManager(loader.pendentes)
 
-    # Mede tempo de set_decision em pasta de grande porte (Desktop)
-    desktop_root = r"C:\Users\Eduardo\Desktop"
+    root_groups = tm.get_root_groups()
+    desktop_root = root_groups[0] if root_groups else r"C:\Users\TestUser\Desktop"
     t0 = time.perf_counter()
     affected = tm.set_decision(desktop_root, TriageDecision.INCLUDE, apply_to_children=True)
     elapsed_ms = (time.perf_counter() - t0) * 1000

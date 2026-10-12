@@ -33,10 +33,10 @@ def test_classify_save_status():
     assert "Vínculo Heurístico — Revisar" in status1
     assert "compartilhada" in status1
 
-    status2 = classify_save_status("C:\\Users\\Eduardo\\Documents\\LEGO", "LEGO MARVEL Super Heroes", {})
+    status2 = classify_save_status("C:\\Users\\TestUser\\Documents\\LEGO", "LEGO MARVEL Super Heroes", {})
     assert status2 == "Legítimo / Provável"
 
-    status3 = classify_save_status("C:\\Users\\Eduardo\\Documents\\fonts\\Edition", "Dying Light 2: Reloaded Edition", {})
+    status3 = classify_save_status("C:\\Users\\TestUser\\Documents\\fonts\\Edition", "Dying Light 2: Reloaded Edition", {})
     assert "Revisar" in status3
 
 

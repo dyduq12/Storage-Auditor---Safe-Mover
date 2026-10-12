@@ -28,10 +28,10 @@ class TestPathUtils:
 
     def test_absolute_drive_path(self):
         if os.name == "nt":
-            path = r"C:\Users\Eduardo\Documents\file.txt"
+            path = r"C:\Users\TestUser\Documents\file.txt"
             ext = to_extended_path(path)
             assert ext.startswith(r"\\?\C:")
-            assert ext == r"\\?\C:\Users\Eduardo\Documents\file.txt"
+            assert ext == r"\\?\C:\Users\TestUser\Documents\file.txt"
             # Idempotente
             assert to_extended_path(ext) == ext
             # Conversão reversa

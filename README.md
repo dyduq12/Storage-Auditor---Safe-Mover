@@ -185,6 +185,12 @@ The test suite covers:
 
 ---
 
+## License
+
+This project is licensed under the terms of the [MIT License](LICENSE). See [LICENSE](LICENSE) for details.
+
+---
+
 # 🇧🇷 Documentação em Português
 
 ## Visão Geral e Princípios
@@ -341,4 +347,4 @@ A suíte valida:
 
 ## Licença
 
-Este projeto está aberto para consulta. Os termos finais de licenciamento serão definidos pelo autor.
+Este projeto é licenciado sob os termos da licença [MIT](LICENSE). Consulte o arquivo [LICENSE](LICENSE) para obter detalhes completos.
