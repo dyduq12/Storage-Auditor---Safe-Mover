@@ -1,0 +1,90 @@
+# =====================================================================
+# STORAGE AUDITOR & SAFE MOVER — .gitignore
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1. Dados Pessoais, Relatórios e Estruturas de Discos Locais do Usuário
+# (NUNCA enviar para repositório público: contém caminhos reais e dados)
+# ---------------------------------------------------------------------
+reports/
+reports_*/
+reports_estrutura_C/
+reports_estrutura_D/
+reports_estrutura_D2/
+validate_reports.py
+*.xlsx
+*.csv
+
+# Bancos de dados de índice e cache incremental
+*.db
+*.sqlite
+*.sqlite3
+storage_auditor_cache.db
+
+# ---------------------------------------------------------------------
+# 2. Configurações, Memórias e Checkpoints do Agente de IA
+# ---------------------------------------------------------------------
+.agents/
+.gemini/
+.antigravity/
+.claude/
+checkpoint-*.md
+
+# ---------------------------------------------------------------------
+# 3. Ambientes Virtuais Python
+# ---------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ---------------------------------------------------------------------
+# 4. Cache, Bytecode e Compilação Python
+# ---------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------
+# 5. Arquivos de Log e Temporários
+# ---------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# ---------------------------------------------------------------------
+# 6. Variáveis de Ambiente e Segredos
+# ---------------------------------------------------------------------
+.env
+.env.*
+*.key
+*.pem
+
+# ---------------------------------------------------------------------
+# 7. IDEs e Editores de Código
+# ---------------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ---------------------------------------------------------------------
+# 8. Arquivos do Sistema Operacional (Windows / macOS)
+# ---------------------------------------------------------------------
+[Dd]esktop.ini
+[Tt]humbs.db
+ehthumbs.db
+$RECYCLE.BIN/
+.DS_Store
+._*
