@@ -3,35 +3,7 @@
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# 1. Dados Pessoais, Relatórios e Estruturas de Discos Locais do Usuário
-# (NUNCA enviar para repositório público: contém caminhos reais e dados)
-# ---------------------------------------------------------------------
-reports/
-reports_*/
-reports_estrutura_C/
-reports_estrutura_D/
-reports_estrutura_D2/
-validate_reports.py
-*.xlsx
-*.csv
-
-# Bancos de dados de índice e cache incremental
-*.db
-*.sqlite
-*.sqlite3
-storage_auditor_cache.db
-
-# ---------------------------------------------------------------------
-# 2. Configurações, Memórias e Checkpoints do Agente de IA
-# ---------------------------------------------------------------------
-.agents/
-.gemini/
-.antigravity/
-.claude/
-checkpoint-*.md
-
-# ---------------------------------------------------------------------
-# 3. Ambientes Virtuais Python
+# 1. Ambientes Virtuais e Gerenciadores de Pacotes Python
 # ---------------------------------------------------------------------
 .venv/
 venv/
@@ -39,48 +11,108 @@ env/
 ENV/
 env.bak/
 venv.bak/
+*.egg-info/
+build/
+dist/
+wheels/
+*.egg
 
 # ---------------------------------------------------------------------
-# 4. Cache, Bytecode e Compilação Python
+# 2. Caches, Bytecode e Compilação Python
 # ---------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyd
+*.so
+
+# Caches de ferramentas e testes
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
-.mypy_cache/
-.ruff_cache/
+nosetests.xml
+coverage.xml
 
 # ---------------------------------------------------------------------
-# 5. Arquivos de Log e Temporários
+# 3. Relatórios, Logs e Dados Gerados Localmente
+# (NUNCA versionar: contêm caminhos reais, índices e metadados locais)
 # ---------------------------------------------------------------------
+reports/
+reports_*/
+reports_estrutura_*/
+reports_estrutura_C/
+reports_estrutura_D/
+reports_estrutura_D2/
+logs/
 *.log
-*.tmp
-*.temp
-*.bak
-*.swp
+*.log.*
+erros*.log
+errosC.log
+*_SO_FALHAS.jsonl
+*_RESUMO.txt
+
+# Planilhas e exportações dinâmicas
+*.xlsx
+*.xls
+*.csv
 
 # ---------------------------------------------------------------------
-# 6. Variáveis de Ambiente e Segredos
+# 4. Bancos de Dados Locais e Caches Incrementais
 # ---------------------------------------------------------------------
-.env
-.env.*
-*.key
-*.pem
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+storage_auditor_cache.*
 
 # ---------------------------------------------------------------------
-# 7. IDEs e Editores de Código
+# 5. Pastas Locais Privadas e Artefatos Locais
+# (Para onde relatórios, inventários e scripts operacionais devem ir)
+# ---------------------------------------------------------------------
+local_artifacts/
+private/
+local/
+temp/
+scratch/
+
+# ---------------------------------------------------------------------
+# 6. Assistentes de IA, Agentes e Memórias Locais
+# ---------------------------------------------------------------------
+.agents/
+.gemini/
+.antigravity/
+.claude/
+.cursor/
+.aider*
+checkpoint-*.md
+
+# ---------------------------------------------------------------------
+# 7. IDEs, Editores e Arquivos de Configuração de Workspace
 # ---------------------------------------------------------------------
 .vscode/
 .idea/
 *.sublime-project
 *.sublime-workspace
+*.swp
+*.swo
+*~
 
 # ---------------------------------------------------------------------
-# 8. Arquivos do Sistema Operacional (Windows / macOS)
+# 8. Segredos, Chaves e Arquivos de Ambiente
+# ---------------------------------------------------------------------
+.env
+.env.*
+*.key
+*.pem
+*.cert
+*.crt
+
+# ---------------------------------------------------------------------
+# 9. Arquivos Temporários e do Sistema Operacional
 # ---------------------------------------------------------------------
 [Dd]esktop.ini
 [Tt]humbs.db
@@ -88,3 +120,9 @@ ehthumbs.db
 $RECYCLE.BIN/
 .DS_Store
 ._*
+*.tmp
+*.temp
+*.bak
+
+# Scripts utilitários de validação local de relatórios
+validate_reports.py
